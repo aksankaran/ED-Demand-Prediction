@@ -1,0 +1,2113 @@
+---
+title: "Emergency Department Demand Prediction"
+author: ""
+date: "`r Sys.Date()`"
+output: html_document:
+  toc: true
+  toc_depth: 2
+  toc_float: true
+  number_sections: true
+  code_folding: hide 
+---
+
+
+## Load Libraries
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+set.seed(123)
+
+# Load libraries
+library(tidyverse)
+library(dbplyr)
+library(knitr)
+library(hms)
+library(tidyr)
+library(lubridate)
+library(data.table)
+library(ggplot2)
+library(scales)
+library(stringr)
+library(weathermetrics)
+library(icd.data)
+library(forcats)
+library(mice)
+library(patchwork)
+library(ggrepel)
+library(broom)
+library(ResourceSelection)
+library(pROC)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(xgboost)
+library(Matrix)
+library(svglite)
+library(HeatStress)
+library(kableExtra)
+library(vip)
+library(smotefamily)
+```
+
+## Load and Clean ED Data
+
+
+```{r}
+Data_2021 <- read.csv("2021.csv")
+Data_2022 <- read.csv("2022.csv")
+Data_2023 <- read.csv("2023.csv")
+Data_2024 <- read.csv("2024.csv")
+DatasetVerOne <- rbind(Data_2021, Data_2022, Data_2023, Data_2024)
+DatasetVerOne <- DatasetVerOne %>%
+  rename(DateOfArrival = ARRIVAL.DATE, TimeOfArrival = ARRIVAL.TIME, Age = AGE, Sex = SEX, TriageCategory = ACUITY.ABBR,
+         ChiefComplaint = Chief.Complaint, EncounterDiagnosis = Diagnosis.Complaint, PatientDisposition = ED.DISPOSITION)
+DatasetVerOne[DatasetVerOne == ""] <- NA
+DatasetVerOne$DateOfArrival <- as.Date(DatasetVerOne$DateOfArrival, format = "%d/%m/%Y")
+DatasetVerOne <- DatasetVerOne %>%
+  mutate(DateTimeArrival = as.POSIXct(paste(DateOfArrival, TimeOfArrival), format = "%Y-%m-%d %H:%M")) %>%
+  arrange(DateTimeArrival)
+DatasetVerOne$Age <- as.numeric(gsub("[^0-9]", "", as.character(DatasetVerOne$Age)))
+DatasetVerOne$Sex <- as.factor(DatasetVerOne$Sex)
+DatasetVerOne$TriageCategory <- as.factor(DatasetVerOne$TriageCategory)
+```
+
+## Process ICD Codes
+```{r}
+DatasetVerTwo <- DatasetVerOne %>%
+  separate(EncounterDiagnosis, into = c("Diagnosis", "ICDCode"), sep = "\\[", extra = "merge", fill = "right") %>%
+  mutate(ICDCode = gsub("]", "", ICDCode), Diagnosis = trimws(Diagnosis))
+DatasetVerTwo$Day <- lubridate::wday(DatasetVerTwo$DateTimeArrival, label = TRUE, abbr = FALSE)
+DatasetVerTwo <- DatasetVerTwo %>% relocate(Day, .after = DateOfArrival)
+DatasetVerThree <- DatasetVerTwo %>% mutate(ICDCode = str_extract(ICDCode, "^[^,\\[]+"))
+```
+
+## Classify ICD Codes
+```{r}
+icd_lookup <- DatasetVerThree %>%
+  select(ICDCode, Diagnosis) %>%
+  distinct() %>%
+  filter(!is.na(ICDCode))
+
+icd_chapter_df <- do.call(rbind, lapply(names(icd10_chapters), function(category) {
+  data.frame(
+    Category = category,
+    Start = icd10_chapters[[category]]["start"],
+    End = icd10_chapters[[category]]["end"],
+    stringsAsFactors = FALSE
+  )
+}))
+
+categorize_icd <- function(icd_code) {
+  icd_prefix <- substr(icd_code, 1, 3)
+  match_row <- icd_chapter_df[icd_chapter_df$Start <= icd_prefix & icd_chapter_df$End >= icd_prefix, ]
+  if (nrow(match_row) > 0) {
+    return(match_row$Category)
+  } else {
+    return("Other/Unknown")
+  }
+}
+
+icd_lookup$ICDCategory <- sapply(icd_lookup$ICDCode, categorize_icd)
+icd_lookup_unique <- icd_lookup %>% distinct(ICDCode, ICDCategory)
+DatasetVerThree <- DatasetVerThree %>%
+  left_join(icd_lookup_unique, by = "ICDCode") %>%
+  relocate(ICDCategory, .after = ICDCode)
+```
+
+## Creating Holidays, Ramadan and Day Type
+```{r}
+holidays <- data.frame(
+  Date = as.Date(c("2021-07-19", "2021-07-20", "2021-07-21", "2021-08-12", "2021-12-01", "2021-12-02", "2021-12-03",
+                   "2022-01-01", "2022-05-02", "2022-05-03", "2022-05-04", "2022-07-08", "2022-07-09", "2022-07-10", "2022-07-30", 
+                   "2022-12-01", "2022-12-02", "2022-12-03", "2023-01-01", "2023-04-21", "2023-04-22", "2023-04-23", 
+                   "2023-06-27", "2023-06-28", "2023-06-29", "2023-07-21", "2023-12-01", "2023-12-02", "2023-12-03", 
+                   "2024-01-01", "2024-04-10", "2024-04-11", "2024-04-12", "2024-06-15", "2024-06-16", "2024-06-17", 
+                   "2024-07-07", "2024-12-01", "2024-12-02", "2024-12-03")),
+  HolidayName = rep("Holiday", 40)
+)
+ramadan_starts <- data.frame(
+  Date = as.Date(c("2022-04-02", "2023-03-23", "2024-03-10")),
+  HolidayName = "RamadanOne"
+)
+special_dates <- bind_rows(holidays, ramadan_starts)
+DatasetVerThree <- DatasetVerThree %>% left_join(special_dates, by = c("DateTimeArrival" = "Date")) %>%
+  mutate(DateType = case_when(
+    weekdays(DateTimeArrival) %in% c("Saturday", "Sunday") ~ "Weekend",
+    TRUE ~ "Weekday"
+  )) %>%
+  relocate(DateType, .after = Day)
+```
+
+## Adding Ramadan Period 
+```{r}
+ramadan_periods <- data.frame(
+  Year = c(2022, 2023, 2024),
+  Start = as.Date(c("2022-04-02", "2023-03-23", "2024-03-11")),
+  End = as.Date(c("2022-05-01", "2023-04-21", "2024-04-09"))
+)
+DatasetVerThree <- DatasetVerThree %>%
+  mutate(Date = as.Date(DateTimeArrival),
+         Year = as.numeric(format(DateTimeArrival, "%Y"))) %>%
+  left_join(ramadan_periods, by = "Year") %>%
+  mutate(RamadanDay = if_else(Date >= Start & Date <= End, paste0("Ramadan", as.integer(Date - Start) + 1), NA_character_))
+```
+
+## Creating Patient Category and Classification of cases(Medical/Trauma)
+```{r}
+# Select relevant columns into DatasetVerFour
+DatasetVerFour <- DatasetVerThree %>%
+  select(
+    Year, DateTimeArrival, Day, DateType, Age, Sex, TriageCategory, Diagnosis, 
+    ICDCode, ICDCategory, PatientDisposition, HolidayName, RamadanDay
+  )
+
+# Add classification (Medical/Trauma/etc.) from ICD lookup
+icd_table <- DatasetVerFour %>% select(ICDCode)
+write.csv(icd_table, "ICD_Codes.csv", row.names = FALSE)
+
+ClassfiedICD <- read.csv("ICD_Codes_Classified.csv")
+UniqueICDTable <- ClassfiedICD %>%
+  distinct(ICDCode, Classification)
+
+DatasetVerFour$Classification <- UniqueICDTable$Classification[
+  match(DatasetVerFour$ICDCode, UniqueICDTable$ICDCode)
+]
+
+DatasetVerFour <- DatasetVerFour %>%
+  relocate(Classification, .after = ICDCategory)
+
+# Categorize age into PatientCategory
+DatasetVerFour <- DatasetVerFour %>%
+  mutate(PatientCategory = case_when(
+    Age <= 12 ~ "Pediatric",
+    Age >= 13 & Age <= 64 ~ "Adult",
+    Age >= 65 ~ "Geriatric",
+    TRUE ~ NA_character_
+  )) %>%
+  relocate(PatientCategory, .after = Age)
+
+# Convert DateTimeArrival to system local time and extract date
+DatasetVerFour <- DatasetVerFour %>%
+  mutate(
+    LocalTime = with_tz(DateTimeArrival, tzone = "Asia/Dubai"),
+    Date = as.Date(LocalTime)
+  )
+
+#  Include only data after 06:00 on June 1, 2021
+DatasetVerFour <- DatasetVerFour %>%
+  filter(DateTimeArrival > as.POSIXct("2021-06-01 06:00:00", tz = "Asia/Dubai"))
+```
+
+## Triage Acuity Grouping
+```{r}
+DatasetVerFour <- DatasetVerFour %>%
+  mutate(AcuityGroup = case_when(
+    TriageCategory %in% c(1, 2) ~ "High Acuity",
+    TriageCategory == 3         ~ "Moderate Acuity",
+    TriageCategory %in% c(4, 5) ~ "Low Acuity",
+    TRUE ~ NA_character_
+  )) %>%
+  relocate(AcuityGroup, .after = TriageCategory)
+```
+
+## Shift Assignments and Visit Counts
+```{r}
+# Convert to data.table for efficient manipulation
+setDT(DatasetVerFour)
+
+# Assign Shift: Day (06:00–17:59) or Overnight (18:00–05:59)
+DatasetVerFour[, Shift := fifelse(
+  hour(DateTimeArrival) >= 6 & hour(DateTimeArrival) < 18, 
+  "Day", "Overnight"
+)]
+
+# Adjust Date: Overnight visits between 00:00–05:59 belong to previous calendar day
+DatasetVerFour[, AdjustedDate := as.IDate(DateTimeArrival) - fifelse(
+  Shift == "Overnight" & hour(DateTimeArrival) < 6, 1, 0
+)]
+
+# Calculate Visit Count per Shift per Adjusted Date
+daily_shift_flow <- DatasetVerFour[, .(Visit_Count = .N), by = .(AdjustedDate, Shift)]
+setnames(daily_shift_flow, "AdjustedDate", "Date")  # Rename for consistency
+
+# Merge Visit_Count back to individual-level records
+DatasetVerFour <- merge(
+  DatasetVerFour, daily_shift_flow,
+  by.x = c("AdjustedDate", "Shift"),
+  by.y = c("Date", "Shift"),
+  all.x = TRUE
+)
+```
+
+## Load and Process Climate Data
+
+```{r climate-data}
+# Load climate data
+ClimateDataVerOne <- read.csv("ClimateDataVer3.csv")
+
+# Clean and format column names
+new_col_names <- as.character(ClimateDataVerOne[1, ])
+colnames(ClimateDataVerOne) <- new_col_names
+ClimateDataVerOne <- ClimateDataVerOne[-1, ]
+ClimateDataVerOne <- ClimateDataVerOne[, colSums(is.na(ClimateDataVerOne)) != nrow(ClimateDataVerOne)]
+colnames(ClimateDataVerOne) <- make.unique(colnames(ClimateDataVerOne))
+names_to_change <- c("Temp.Dry...C.Mean", "Relative.Humidity....Mean", "Rainfall.mm.Total")
+new_names <- c("Temp_Dry_C", "Relative_Humidity", "Rainfall_mm")
+names(ClimateDataVerOne)[names(ClimateDataVerOne) %in% names_to_change] <- new_names
+names(ClimateDataVerOne) <- c("Year", "Month", "Day", "TempCentigrade", "RelativeHumidityPercent", "Rainfallmm")
+
+# Convert to numeric
+ClimateDataVerOne <- ClimateDataVerOne %>%
+  mutate(across(everything(), as.numeric),
+         Date = make_date(Year, Month, Day))
+
+# Compute Dew Point and WBGT
+calculate_dew_point <- function(temp, rh) {
+  a <- 17.27
+  b <- 237.7
+  alpha <- ((a * temp) / (b + temp)) + log(rh / 100)
+  return((b * alpha) / (a - alpha))
+}
+
+ClimateDataVerTwo <- ClimateDataVerOne %>%
+  rowwise() %>%
+  mutate(
+    DewPoint = calculate_dew_point(TempCentigrade, RelativeHumidityPercent),
+    WBGT_Shade = wbgt.Bernard(tas = TempCentigrade, dewp = DewPoint)$data
+  ) %>%
+  ungroup()
+
+ClimateDataVerTwo$WBGT_Shade <- as.numeric(ClimateDataVerTwo$WBGT_Shade)
+
+# Assign WBGT Heat Stress Categories
+ClimateDataVerTwo <- ClimateDataVerTwo %>%
+  mutate(HeatStressCategory = case_when(
+    WBGT_Shade < 25.6 ~ "No Stress",
+    WBGT_Shade >= 25.6 & WBGT_Shade < 27.8 ~ "Mild Risk",
+    WBGT_Shade >= 27.8 & WBGT_Shade < 29.4 ~ "Moderate Risk",
+    WBGT_Shade >= 29.4 & WBGT_Shade < 31.1 ~ "High Risk",
+    WBGT_Shade >= 31.1 ~ "Extreme Conditions",
+    TRUE ~ "Unknown"
+  ))
+
+# Assign Seasons
+ClimateDataVerTwo <- ClimateDataVerTwo %>%
+  mutate(Date = as.Date(Date),
+         Month = format(Date, "%m"),
+         Season = case_when(
+           Month %in% c("12", "01", "02", "03") ~ "Winter",
+           Month %in% c("06", "07", "08", "09") ~ "Summer",
+           TRUE ~ "Other"
+         )) %>%
+  select(-Month)
+
+# Join Climate and ED Data
+DatasetVerFour <- DatasetVerFour %>% mutate(Date = as.Date(Date))
+ClimateDataVerTwo <- ClimateDataVerTwo %>% mutate(Date = as.Date(Date))
+DatasetVerFive <- DatasetVerFour %>%
+  left_join(ClimateDataVerTwo, by = "Date")
+
+# Create DatasetVerSix for modeling
+DatasetVerSix <- DatasetVerFive %>%
+  select(DateTimeArrival, DateType, Shift, Age, PatientCategory, Sex, TriageCategory, AcuityGroup, Diagnosis, 
+         ICDCode, ICDCategory, Classification, PatientDisposition, HolidayName, RamadanDay, 
+         AdjustedDate, Date, Rainfallmm, HeatStressCategory, Season) %>%
+  relocate(Date, .before = DateTimeArrival) %>%
+  relocate(AdjustedDate, .before = PatientCategory)
+```
+
+## Creating Training and Test Sets
+
+```{r}
+# Calculate visit counts per AdjustedDate and Shift
+visit_counts <- DatasetVerSix %>%
+  group_by(AdjustedDate, Shift) %>%
+  summarise(Visit_Count = n(), .groups = 'drop')
+
+# Merge visit counts back into DatasetVerSix
+DatasetVerSix <- DatasetVerSix %>%
+  left_join(visit_counts, by = c("AdjustedDate", "Shift"))
+
+# Define train/test split date
+split_point <- as.Date("2023-08-01")
+
+# Create Train/Test sets
+TrainDataVerOne <- DatasetVerSix %>% filter(Date < split_point)
+TestDataVerOne  <- DatasetVerSix %>% filter(Date >= split_point)
+
+# Compute 15th and 75th percentiles for flow thresholds
+percentile_day_train <- quantile(TrainDataVerOne %>% filter(Shift == "Day") %>% pull(Visit_Count), c(0.15, 0.75))
+percentile_overnight_train <- quantile(TrainDataVerOne %>% filter(Shift == "Overnight") %>% pull(Visit_Count), c(0.15, 0.75))
+
+# Categorize flow based on percentiles
+TrainDataVerOne <- TrainDataVerOne %>%
+  mutate(
+    FlowCategory = case_when(
+      Shift == "Day" & Visit_Count <= percentile_day_train[1] ~ "Quiet Day",
+      Shift == "Day" & Visit_Count >= percentile_day_train[2] ~ "Busy Day",
+      Shift == "Day" ~ "Normal Day",
+      Shift == "Overnight" & Visit_Count <= percentile_overnight_train[1] ~ "Quiet Overnight",
+      Shift == "Overnight" & Visit_Count >= percentile_overnight_train[2] ~ "Busy Overnight",
+      Shift == "Overnight" ~ "Normal Overnight",
+      TRUE ~ "Unknown"
+    )
+  )
+```
+
+## Flow Category Distribution (Training Set)
+
+```{r}
+Trainset_flow_plot <- ggplot(TrainDataVerOne, aes(x = FlowCategory, fill = FlowCategory)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5, size = 3) +
+  labs(title = "Distribution of Flow Categories in Training Set",
+       x = "Flow Category", y = "Number of Days") +
+  theme_minimal(base_size = 10) +
+  theme(plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        legend.position = "none")
+
+svglite::svglite("svg/Trainset_FlowCategory_Distribution.svg", width = 6, height = 4)
+print(Trainset_flow_plot)
+dev.off()
+```
+
+## Prepare Data for Binary Classification
+
+```{r}
+TrainTwoClass <- TrainDataVerOne %>%
+  filter(FlowCategory %in% c("Quiet Day", "Quiet Overnight", "Busy Day", "Busy Overnight")) %>%
+  mutate(
+    FlowBinary = factor(if_else(grepl("Busy", FlowCategory), "Busy", "Quiet"),
+                        levels = c("Quiet", "Busy"))
+  )
+
+TrainDay <- TrainTwoClass %>% filter(Shift == "Day")
+TrainOvernight <- TrainTwoClass %>% filter(Shift == "Overnight")
+```
+
+## Descriptive Statistics – Training Set
+
+### DateType Distribution by Flow (Quiet/Busy)
+```{r}
+# Day shift proportions
+DateType_day_summary <- TrainDay %>%
+  count(DateType, FlowBinary) %>%
+  group_by(DateType) %>%
+  mutate(percent = round(n / sum(n) * 100, 1)) %>%
+  ungroup() %>%
+  select(FlowBinary, DateType, n, percent) %>%
+  add_row(FlowBinary = "Total", DateType = "All", n = sum(.$n), percent = 100.0) %>%
+  mutate(FlowBinary = factor(FlowBinary, levels = c("Quiet", "Busy", "Total")))
+
+DateTypeDayPlot <- DateType_day_summary %>%
+  filter(FlowBinary != "Total") %>%
+  ggplot(aes(x = FlowBinary, y = percent, fill = DateType)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = paste0(percent, "%")), position = position_dodge(0.9), vjust = -0.3, size = 3) +
+  scale_fill_manual(values = c("Weekday" = "#1f78b4", "Weekend" = "#a6cee3")) +
+  labs(title = "Quiet and Busy Day Shifts by Weekday and Weekend", x = "Flow Status", y = "Percentage (%)", fill = "Day Type") +
+  theme_minimal() +
+  theme(legend.position = "top", plot.title = element_text(hjust = 0.5, size = 10))
+
+chisq.test(table(TrainDay$DateType, TrainDay$FlowBinary))
+
+# Overnight shift proportions
+DateType_overnight_summary <- TrainOvernight %>%
+  count(DateType, FlowBinary) %>%
+  group_by(DateType) %>%
+  mutate(percent = round(n / sum(n) * 100, 1)) %>%
+  ungroup() %>%
+  select(FlowBinary, DateType, n, percent) %>%
+  add_row(FlowBinary = "Total", DateType = "All", n = sum(.$n), percent = 100.0) %>%
+  mutate(FlowBinary = factor(FlowBinary, levels = c("Quiet", "Busy", "Total")))
+
+DateTypeOvernightPlot <- DateType_overnight_summary %>%
+  filter(FlowBinary != "Total") %>%
+  ggplot(aes(x = FlowBinary, y = percent, fill = DateType)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = paste0(percent, "%")), position = position_dodge(0.9), vjust = -0.3, size = 3) +
+  scale_fill_manual(values = c("Weekday" = "#1f78b4", "Weekend" = "#a6cee3")) +
+  labs(title = "Quiet and Busy Overnight Shifts by Weekday and Weekend", x = "Flow Status", y = "Percentage (%)", fill = "Day Type") +
+  theme_minimal() +
+  theme(legend.position = "top", plot.title = element_text(hjust = 0.5, size = 10))
+
+chisq.test(table(TrainOvernight$DateType, TrainOvernight$FlowBinary))
+
+# Combine both plots
+DayTypeCombinedPlot <- wrap_elements(DateTypeDayPlot) / wrap_elements(DateTypeOvernightPlot) +
+  plot_annotation(theme = theme(plot.title = element_blank()))
+
+DayTypeCombinedPlot
+```
+
+### Age Distribution
+```{r}
+# Handle invalid/missing age values
+TrainDay <- TrainDay %>% mutate(Age = ifelse(Age > 120, NA, Age))
+TrainOvernight <- TrainOvernight %>% mutate(Age = ifelse(Age > 120, NA, Age))
+
+# Impute missing with group-wise median
+TrainDay <- TrainDay %>% group_by(FlowBinary) %>% mutate(Age = ifelse(is.na(Age), median(Age, na.rm = TRUE), Age)) %>% ungroup()
+TrainOvernight <- TrainOvernight %>% group_by(FlowBinary) %>% mutate(Age = ifelse(is.na(Age), median(Age, na.rm = TRUE), Age)) %>% ungroup()
+
+# Summary tables
+TrainAgeDaySummary <- TrainDay %>% group_by(FlowBinary) %>% summarise(Count = n(), Mean_Age = mean(Age), SD_Age = sd(Age), Median_Age = median(Age), Min_Age = min(Age), Max_Age = max(Age))
+TrainAgeOvernightSummary <- TrainOvernight %>% group_by(FlowBinary) %>% summarise(Count = n(), Mean_Age = mean(Age), SD_Age = sd(Age), Median_Age = median(Age), Min_Age = min(Age), Max_Age = max(Age))
+
+# Density plots
+AgeDayPlot <- ggplot(TrainDay, aes(x = Age, fill = FlowBinary)) + geom_density(alpha = 0.5) + theme_minimal() + labs(title = "Day Shift", x = "Age", y = "Density")
+AgeOvernightPlot <- ggplot(TrainOvernight, aes(x = Age, fill = FlowBinary)) + geom_density(alpha = 0.5) + theme_minimal() + labs(title = "Overnight Shift", x = "Age", y = "Density")
+
+# Combine plots
+AgeCombinedPlot <- wrap_elements(AgeDayPlot) / wrap_elements(AgeOvernightPlot)
+
+# Statistical test
+wilcox.test(Age ~ FlowBinary, data = TrainDay)
+wilcox.test(Age ~ FlowBinary, data = TrainOvernight)
+
+AgeCombinedPlot
+```
+
+### Patient Category Summary
+```{r}
+# Impute PatientCategory based on age if missing
+TrainDay <- TrainDay %>% mutate(PatientCategory = ifelse(is.na(PatientCategory), case_when(Age <= 12 ~ "Pediatric", Age >= 65 ~ "Geriatric", TRUE ~ "Adult"), PatientCategory))
+TrainOvernight <- TrainOvernight %>% mutate(PatientCategory = ifelse(is.na(PatientCategory), case_when(Age <= 12 ~ "Pediatric", Age >= 65 ~ "Geriatric", TRUE ~ "Adult"), PatientCategory))
+
+# Summary tables
+patientcategory_day_summary <- TrainDay %>% count(PatientCategory, FlowBinary) %>% group_by(FlowBinary) %>% mutate(percent = round(n / sum(n) * 100, 1))
+patientcategory_overnight_summary <- TrainOvernight %>% count(PatientCategory, FlowBinary) %>% group_by(FlowBinary) %>% mutate(percent = round(n / sum(n) * 100, 1))
+
+# Plots
+PatientCategoryDayPlot <- ggplot(patientcategory_day_summary, aes(x = FlowBinary, y = percent, fill = PatientCategory)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = paste0(percent, "%")), position = position_dodge(0.9), vjust = -0.3, size = 3) +
+  scale_fill_manual(values = c("Pediatric" = "#a6cee3", "Adult" = "#1f78b4", "Geriatric" = "#084081")) +
+  labs(title = "Day Shift", x = "Flow Status", y = "Percentage", fill = "Patient Category") +
+  theme_minimal()
+
+PatientCategoryOvernightPlot <- ggplot(patientcategory_overnight_summary, aes(x = FlowBinary, y = percent, fill = PatientCategory)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = paste0(percent, "%")), position = position_dodge(0.9), vjust = -0.3, size = 3) +
+  scale_fill_manual(values = c("Pediatric" = "#a6cee3", "Adult" = "#1f78b4", "Geriatric" = "#084081")) +
+  labs(title = "Overnight Shift", x = "Flow Status", y = "Percentage", fill = "Patient Category") +
+  theme_minimal()
+
+PatientCategoryCombinedPlot <- wrap_elements(PatientCategoryDayPlot) / wrap_elements(PatientCategoryOvernightPlot)
+
+PatientCategoryCombinedPlot
+```
+
+### Gender Summary
+```{r}
+TrainDay <- TrainDay %>% filter(Sex != "Unknown")
+TrainOvernight <- TrainOvernight %>% filter(Sex != "Unknown")
+
+sex_day_summary <- TrainDay %>% count(Sex, FlowBinary) %>% group_by(FlowBinary) %>% mutate(percent = round(n / sum(n) * 100, 1))
+sex_overnight_summary <- TrainOvernight %>% count(Sex, FlowBinary) %>% group_by(FlowBinary) %>% mutate(percent = round(n / sum(n) * 100, 1))
+
+SexDayPlot <- ggplot(sex_day_summary, aes(x = FlowBinary, y = percent, fill = Sex)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = paste0(percent, "%")), position = position_dodge(0.9), vjust = -0.3, size = 3) +
+  scale_fill_manual(values = c("Male" = "#a6cee3", "Female" = "#084081")) +
+  labs(title = "Day Shift", x = "Flow Status", y = "Percentage") +
+  theme_minimal()
+
+SexOvernightPlot <- ggplot(sex_overnight_summary, aes(x = FlowBinary, y = percent, fill = Sex)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = paste0(percent, "%")), position = position_dodge(0.9), vjust = -0.3, size = 3) +
+  scale_fill_manual(values = c("Male" = "#a6cee3", "Female" = "#084081")) +
+  labs(title = "Overnight Shift", x = "Flow Status", y = "Percentage") +
+  theme_minimal()
+
+GenderCombinedPlot <- wrap_elements(SexDayPlot) / wrap_elements(SexOvernightPlot)
+
+GenderCombinedPlot
+```
+
+### Triage Category Summary
+```{r}
+TrainDay <- TrainDay %>% filter(!is.na(TriageCategory))
+TrainOvernight <- TrainOvernight %>% filter(!is.na(TriageCategory))
+
+# summary triage category day
+triage_day_summary <- TrainDay %>%
+  group_by(TriageCategory, FlowBinary) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = TriageCategory, values_from = n, values_fill = 0) %>%
+  rowwise() %>%
+  mutate(
+    Total = sum(c_across(`1`:`5`)),
+    `1` = percent(`1` / Total, accuracy = 0.1),
+    `2` = percent(`2` / Total, accuracy = 0.1),
+    `3` = percent(`3` / Total, accuracy = 0.1),
+    `4` = percent(`4` / Total, accuracy = 0.1),
+    `5` = percent(`5` / Total, accuracy = 0.1)
+  ) %>%
+  ungroup() %>%
+  select(FlowBinary, `1`, `2`, `3`, `4`, `5`, Total)
+
+# Prepare plot data
+triage_plot_data <- TrainDay %>%
+  group_by(TriageCategory, FlowBinary) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(FlowBinary) %>%
+  mutate(percent = n / sum(n)) %>%
+  ungroup()
+# Define CTAS color palette
+ctas_colors <- c(
+  "1" = "#e41a1c",  # Red
+  "2" = "#ff7f00",  # Orange
+  "3" = "#ffff33",  # Yellow
+  "4" = "#4daf4a",  # Green
+  "5" = "#377eb8"   # Blue
+)
+# Plot
+TriageCategoryDayPlot <- ggplot(triage_plot_data, aes(x = FlowBinary, y = percent, fill = as.factor(TriageCategory))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(
+    aes(label = percent(percent, accuracy = 0.1)),
+    position = position_dodge(0.9),
+    vjust = -0.3, size = 3
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = ctas_colors, name = "Triage Category") +
+  labs(
+    title = "Distribution of Triage Categories in Quiet and Busy Day Shifts",
+    x = "Flow Status",
+    y = "Percentage"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.title = element_text(size = 8)
+  )
+
+# summary triage category overnight
+triage_overnight_summary <- TrainOvernight %>%
+  group_by(TriageCategory, FlowBinary) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = TriageCategory, values_from = n, values_fill = 0) %>%
+  rowwise() %>%
+  mutate(
+    Total = sum(c_across(`1`:`5`)),
+    `1` = percent(`1` / Total, accuracy = 0.1),
+    `2` = percent(`2` / Total, accuracy = 0.1),
+    `3` = percent(`3` / Total, accuracy = 0.1),
+    `4` = percent(`4` / Total, accuracy = 0.1),
+    `5` = percent(`5` / Total, accuracy = 0.1)
+  ) %>%
+  ungroup() %>%
+  select(FlowBinary, `1`, `2`, `3`, `4`, `5`, Total)
+
+# Prepare plot data
+triage_plot_overnight <- TrainOvernight %>%
+  group_by(TriageCategory, FlowBinary) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(FlowBinary) %>%
+  mutate(percent = n / sum(n)) %>%
+  ungroup()
+# Define CTAS color palette
+ctas_colors <- c(
+  "1" = "#e41a1c",  # Red
+  "2" = "#ff7f00",  # Orange
+  "3" = "#ffff33",  # Yellow
+  "4" = "#4daf4a",  # Green
+  "5" = "#377eb8"   # Blue
+)
+# Plot
+TriageCategoryOvernightPlot <- ggplot(triage_plot_overnight, aes(x = FlowBinary, y = percent, fill = as.factor(TriageCategory))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(
+    aes(label = percent(percent, accuracy = 0.1)),
+    position = position_dodge(0.9),
+    vjust = -0.3, size = 3
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = ctas_colors, name = "Triage Category") +
+  labs(
+    title = "Distribution of Triage Categories in Quiet and Busy Overnight Shifts",
+    x = "Flow Status",
+    y = "Percentage"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.title = element_text(size = 8)
+  )
+
+
+chisq.test(table(TrainOvernight$TriageCategory, TrainOvernight$FlowBinary))
+
+## Combining triage category day and overnight plot
+TriageCategoryCombinedPlot <- wrap_elements(TriageCategoryDayPlot) / wrap_elements(TriageCategoryOvernightPlot) +
+  plot_annotation(
+    title = NULL 
+    )
+
+TriageCategoryCombinedPlot
+```
+
+
+
+### Classification of Cases (Medical vs Trauma)
+
+```{r classification-descriptive, warning=FALSE, message=FALSE}
+# ---- Day Shift Classification ----
+# Summary Table
+classification_day_summary <- TrainDay %>%
+  group_by(Classification, FlowBinary) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = Classification, values_from = n, values_fill = 0) %>%
+  mutate(
+    Total = rowSums(across(where(is.numeric))),
+    `Medical %` = percent(Medical / Total, accuracy = 0.1),
+    `Trauma %`  = percent(Trauma / Total, accuracy = 0.1)
+  ) %>%
+  select(FlowBinary, Medical, Trauma, Total, `Medical %`, `Trauma %`)
+
+# Plot Data
+classification_plot_day <- TrainDay %>%
+  group_by(Classification, FlowBinary) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(FlowBinary) %>%
+  mutate(percent = n / sum(n)) %>%
+  ungroup()
+
+# Plot
+ClassificationDayPlot <- ggplot(classification_plot_day, aes(x = FlowBinary, y = percent, fill = Classification)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = percent(percent, accuracy = 0.1)),
+            position = position_dodge(0.9), vjust = -0.3, size = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c("Medical" = "#a6cee3", "Trauma" = "#084081")) +
+  labs(
+    title = "Day Shift",
+    x = "Flow Status",
+    y = "Percentage",
+    fill = "Classification"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+
+
+# ---- Overnight Shift Classification ----
+# Summary Table
+classification_overnight_summary <- TrainOvernight %>%
+  group_by(Classification, FlowBinary) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = Classification, values_from = n, values_fill = 0) %>%
+  mutate(
+    Total = rowSums(across(where(is.numeric))),
+    `Medical %` = percent(Medical / Total, accuracy = 0.1),
+    `Trauma %`  = percent(Trauma / Total, accuracy = 0.1)
+  ) %>%
+  select(FlowBinary, Medical, Trauma, Total, `Medical %`, `Trauma %`)
+
+# Plot Data
+classification_plot_overnight <- TrainOvernight %>%
+  group_by(Classification, FlowBinary) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(FlowBinary) %>%
+  mutate(percent = n / sum(n)) %>%
+  ungroup()
+
+# Plot
+ClassificationOvernightPlot <- ggplot(classification_plot_overnight, aes(x = FlowBinary, y = percent, fill = Classification)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = percent(percent, accuracy = 0.1)),
+            position = position_dodge(0.9), vjust = -0.3, size = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c("Medical" = "#a6cee3", "Trauma" = "#084081")) +
+  labs(
+    title = "Overnight Shift",
+    x = "Flow Status",
+    y = "Percentage",
+    fill = "Classification"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+
+# Combined Plot
+ClassificationCombinedPlot <- wrap_elements(ClassificationDayPlot) / wrap_elements(ClassificationOvernightPlot) +
+  plot_annotation(
+    title = "Quiet and Busy by Shift and Type of Cases",
+    theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+  )
+
+ClassificationCombinedPlot
+```
+
+### ICD Category Distribution
+
+```{r ICDCategory_Processing, message=FALSE, warning=FALSE}
+
+# Day Shift
+TrainDay <- TrainDay %>% filter(!is.na(ICDCategory))
+
+rare_icd_day <- TrainDay %>%
+  count(ICDCategory) %>%
+  filter(n < 100) %>%
+  pull(ICDCategory)
+
+TrainDay <- TrainDay %>%
+  mutate(ICDCategory = ifelse(ICDCategory %in% rare_icd_day, "Other/Unknown", ICDCategory),
+         ICDCategory = droplevels(factor(ICDCategory)))
+
+shorten_icd <- function(label) {
+  str_replace_all(label, c(
+    "Diseases of the " = "",
+    "system and " = "",
+    "certain " = "",
+    "and certain disorders involving the immune mechanism" = " & immune",
+    "certain other consequences of external causes" = "external causes",
+    "factors influencing health status and contact with health services" = "health services factors",
+    "subcutaneous tissue" = "skin tissue",
+    "musculoskeletal system" = "musculoskeletal",
+    "chromosomal abnormalities" = "genetic abnormalities",
+    "congenital malformations" = "congenital malf.",
+    "nutritional and " = "",
+    "abnormal clinical and laboratory findings, not elsewhere classified" = "clinical findings"
+  ))
+}
+
+icd_day_summary <- TrainDay %>%
+  group_by(ICDCategory, FlowBinary) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(ICDCategory = shorten_icd(ICDCategory)) %>%
+  pivot_wider(names_from = ICDCategory, values_from = n, values_fill = 0) %>%
+  mutate(
+    Total = rowSums(across(where(is.numeric))),
+    across(-c(FlowBinary, Total), ~ percent(.x / Total, accuracy = 0.1))
+  ) %>%
+  relocate(FlowBinary, .before = 1) %>%
+  arrange(match(FlowBinary, c("Quiet", "Busy")))
+
+icd_plot_data <- TrainDay %>%
+  group_by(FlowBinary, ICDCategory) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(FlowBinary) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup()
+
+icd_plot_data$ICDCategory <- fct_reorder(
+  str_wrap(icd_plot_data$ICDCategory, width = 25), 
+  icd_plot_data$Percent,
+  .fun = sum
+)
+
+ICDCategoryDayPlot <- ggplot(icd_plot_data, aes(
+  x = Percent,
+  y = fct_reorder(ICDCategory, Percent),
+  color = FlowBinary
+)) +
+  geom_segment(aes(x = 0, xend = Percent, yend = ICDCategory), color = "gray80") +
+  geom_point(size = 3) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_manual(values = c("Quiet" = "#2C7BB6", "Busy" = "#D73027")) +
+  labs(x = "Percentage", y = "ICD Category") +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 10),
+    axis.text.y = element_text(size = 8),
+    legend.position = "right",
+    legend.title = element_text(size = 9, face = "bold")
+  )
+
+# Overnight Shift
+TrainOvernight <- TrainOvernight %>% filter(!is.na(ICDCategory))
+
+rare_icd_overnight <- TrainOvernight %>%
+  count(ICDCategory) %>%
+  filter(n < 100) %>%
+  pull(ICDCategory)
+
+TrainOvernight <- TrainOvernight %>%
+  mutate(ICDCategory = ifelse(ICDCategory %in% rare_icd_overnight, "Other/Unknown", ICDCategory),
+         ICDCategory = droplevels(factor(ICDCategory)))
+
+icd_overnight_summary <- TrainOvernight %>%
+  group_by(ICDCategory, FlowBinary) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(ICDCategory = shorten_icd(ICDCategory)) %>%
+  pivot_wider(names_from = ICDCategory, values_from = n, values_fill = 0) %>%
+  mutate(
+    Total = rowSums(across(where(is.numeric))),
+    across(-c(FlowBinary, Total), ~ percent(.x / Total, accuracy = 0.1))
+  ) %>%
+  relocate(FlowBinary, .before = 1) %>%
+  arrange(match(FlowBinary, c("Quiet", "Busy")))
+
+icdovernight_plot_data <- TrainOvernight %>%
+  group_by(FlowBinary, ICDCategory) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(FlowBinary) %>%
+  mutate(Percent = n / sum(n)) %>%
+  ungroup()
+
+icdovernight_plot_data$ICDCategory <- fct_reorder(
+  str_wrap(icdovernight_plot_data$ICDCategory, width = 25), 
+  icdovernight_plot_data$Percent,
+  .fun = sum
+)
+
+ICDCategoryOvernightPlot <- ggplot(icdovernight_plot_data, aes(
+  x = Percent,
+  y = fct_reorder(ICDCategory, Percent),
+  color = FlowBinary
+)) +
+  geom_segment(aes(x = 0, xend = Percent, yend = ICDCategory), color = "gray80") +
+  geom_point(size = 3) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_manual(values = c("Quiet" = "#2C7BB6", "Busy" = "#D73027")) +
+  labs(x = "Percentage", y = "ICD Category") +
+  theme_minimal() +
+  theme(
+    axis.title = element_text(size = 10),
+    axis.text.y = element_text(size = 8),
+    legend.position = "right",
+    legend.title = element_text(size = 9, face = "bold")
+  )
+
+# Combined Plot
+ICDCategoryCombinedPlot <- wrap_elements(ICDCategoryDayPlot) / wrap_elements(ICDCategoryOvernightPlot) +
+  plot_annotation(title = NULL)
+
+ICDCategoryCombinedPlot
+
+```
+
+### Heat Stress Category – Descriptive Summary and Visualization
+```{r}
+# Day Shift Summary
+heatstress_day_summary <- TrainDay %>%
+  group_by(HeatStressCategory, FlowBinary) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = HeatStressCategory, values_from = n, values_fill = 0) %>%
+  mutate(
+    Total = rowSums(across(where(is.numeric))),
+    across(-FlowBinary, ~ percent(.x / Total, accuracy = 0.1), .names = "{.col} %")
+  ) %>%
+  select(FlowBinary, everything())
+
+heatstress_plot_day <- TrainDay %>%
+  group_by(HeatStressCategory, FlowBinary) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(FlowBinary) %>%
+  mutate(percent = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(HeatStressCategory = factor(
+    HeatStressCategory,
+    levels = c("Extreme Conditions", "High Risk", "Moderate Risk", "Mild Risk", "No Stress")
+  ))
+
+heatstress_colors <- c(
+  "Extreme Conditions" = "#67000d",
+  "High Risk" = "#a50f15",
+  "Moderate Risk" = "#cb181d",
+  "Mild Risk" = "#fb6a4a",
+  "No Stress" = "#fcbba1"
+)
+
+HeatStressDayPlot <- ggplot(heatstress_plot_day, aes(x = FlowBinary, y = percent, fill = HeatStressCategory)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = percent(percent, accuracy = 0.1)),
+            position = position_dodge(0.9), vjust = -0.3, size = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = heatstress_colors, name = "Heat Stress Category") +
+  labs(title = "Day Shift", x = "Flow Status", y = "Percentage") +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.title = element_text(size = 8)
+  )
+
+# Overnight Shift Summary
+heatstress_overnight_summary <- TrainOvernight %>%
+  group_by(HeatStressCategory, FlowBinary) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = HeatStressCategory, values_from = n, values_fill = 0) %>%
+  mutate(
+    Total = rowSums(across(where(is.numeric))),
+    across(-FlowBinary, ~ percent(.x / Total, accuracy = 0.1), .names = "{.col} %")
+  ) %>%
+  select(FlowBinary, everything())
+
+heatstress_plot_overnight <- TrainOvernight %>%
+  group_by(HeatStressCategory, FlowBinary) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(FlowBinary) %>%
+  mutate(percent = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(HeatStressCategory = factor(
+    HeatStressCategory,
+    levels = c("Extreme Conditions", "High Risk", "Moderate Risk", "Mild Risk", "No Stress")
+  ))
+
+HeatStressOvernightPlot <- ggplot(heatstress_plot_overnight, aes(x = FlowBinary, y = percent, fill = HeatStressCategory)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = percent(percent, accuracy = 0.1)),
+            position = position_dodge(0.9), vjust = -0.3, size = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = heatstress_colors, name = "Heat Stress Category") +
+  labs(title = "Overnight Shift", x = "Flow Status", y = "Percentage") +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.title = element_text(size = 8)
+  )
+
+# Combined Plot
+HeatStressCombinedPlot <- wrap_elements(HeatStressDayPlot) / wrap_elements(HeatStressOvernightPlot) +
+  plot_annotation(
+    title = "Heat Stress Category Distribution by Flow Status",
+    theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+  )
+
+HeatStressCombinedPlot
+
+```
+
+
+
+
+## Season 
+```{r season-analysis, message=FALSE, warning=FALSE, fig.height=10, fig.width=7}
+# Day Shift Summary
+season_day_summary <- TrainDay %>%
+  filter(Season %in% c("Summer", "Winter")) %>%
+  group_by(Season, FlowBinary) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = Season, values_from = n, values_fill = 0) %>%
+  mutate(
+    Total = rowSums(across(where(is.numeric))),
+    across(-FlowBinary, ~ percent(.x / Total, accuracy = 0.1), .names = "{.col} %")
+  ) %>%
+  select(FlowBinary, everything())
+
+season_plot_day <- TrainDay %>%
+  filter(Season %in% c("Summer", "Winter")) %>%
+  group_by(Season, FlowBinary) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(FlowBinary) %>%
+  mutate(percent = n / sum(n)) %>%
+  ungroup()
+
+SeasonDayPlot <- ggplot(season_plot_day, aes(x = FlowBinary, y = percent, fill = Season)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = percent(percent, accuracy = 0.1)),
+            position = position_dodge(0.9), vjust = -0.3, size = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c("Summer" = "#a6cee3", "Winter" = "#084081")) +
+  labs(
+    title = "Seasonal Variation in Patient Flow – Day Shifts",
+    x = "Flow Status",
+    y = "Percentage",
+    fill = "Season"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.title = element_text(size = 8)
+  )
+
+# Overnight Shift Summary
+season_overnight_summary <- TrainOvernight %>%
+  filter(Season %in% c("Summer", "Winter")) %>%
+  group_by(Season, FlowBinary) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = Season, values_from = n, values_fill = 0) %>%
+  mutate(
+    Total = rowSums(across(where(is.numeric))),
+    across(-FlowBinary, ~ percent(.x / Total, accuracy = 0.1), .names = "{.col} %")
+  ) %>%
+  select(FlowBinary, everything())
+
+season_plot_overnight <- TrainOvernight %>%
+  filter(Season %in% c("Summer", "Winter")) %>%
+  group_by(Season, FlowBinary) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(FlowBinary) %>%
+  mutate(percent = n / sum(n)) %>%
+  ungroup()
+
+SeasonOvernightPlot <- ggplot(season_plot_overnight, aes(x = FlowBinary, y = percent, fill = Season)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = percent(percent, accuracy = 0.1)),
+            position = position_dodge(0.9), vjust = -0.3, size = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c("Summer" = "#a6cee3", "Winter" = "#084081")) +
+  labs(
+    title = "Seasonal Variation in Patient Flow – Overnight Shifts",
+    x = "Flow Status",
+    y = "Percentage",
+    fill = "Season"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    legend.title = element_text(size = 8)
+  )
+
+# Combined Plot
+SeasonCombinedPlot <- wrap_elements(SeasonDayPlot) / wrap_elements(SeasonOvernightPlot) +
+  plot_annotation(
+    title = "Seasonal Distribution of Patient Flow by Shift",
+    theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+  )
+
+SeasonCombinedPlot
+
+```
+
+
+
+
+## Ramadan Period Distribution
+```{r ramadan-distribution, echo=FALSE, fig.height=10, fig.width=7, fig.align='center'}
+# ---- Day Shift ----
+TrainDay <- TrainDay %>%
+  mutate(
+    RamadanStatus = ifelse(is.na(RamadanDay) | RamadanDay == "", "Non-Ramadan", "Ramadan")
+  )
+
+ramadan_only_day <- TrainDay %>%
+  filter(RamadanStatus == "Ramadan")
+
+ramadan_day_summary <- ramadan_only_day %>%
+  count(FlowBinary) %>%
+  mutate(
+    Proportion = round(n / sum(n) * 100, 1),
+    FlowType = FlowBinary
+  )
+
+RamadanDayPlot <- ggplot(ramadan_day_summary, aes(x = FlowType, y = Proportion, color = FlowType)) +
+  geom_point(size = 2) +
+  geom_segment(aes(xend = FlowType, y = 0, yend = Proportion), color = "gray80") +
+  geom_text(aes(label = paste0(Proportion, "%")), hjust = -0.3, size = 2, color = "black") +
+  coord_flip() +
+  scale_color_manual(values = c("Quiet" = "#2C7BB6", "Busy" = "#D73027")) +
+  labs(
+    title = "Proportion of Quiet and Busy Shifts During Ramadan (Day)",
+    x = "",
+    y = "Percentage"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.text.y = element_text(size = 9, face = "bold")
+  )
+
+# ---- Overnight Shift ----
+TrainOvernight <- TrainOvernight %>%
+  mutate(
+    RamadanStatus = ifelse(is.na(RamadanDay) | RamadanDay == "", "Non-Ramadan", "Ramadan")
+  )
+
+ramadan_only_overnight <- TrainOvernight %>%
+  filter(RamadanStatus == "Ramadan")
+
+ramadan_overnight_summary <- ramadan_only_overnight %>%
+  count(FlowBinary) %>%
+  mutate(
+    Proportion = round(n / sum(n) * 100, 1),
+    FlowType = FlowBinary
+  )
+
+RamadanOvernightPlot <- ggplot(ramadan_overnight_summary, aes(x = FlowType, y = Proportion, color = FlowType)) +
+  geom_point(size = 2) +
+  geom_segment(aes(xend = FlowType, y = 0, yend = Proportion), color = "gray80") +
+  geom_text(aes(label = paste0(Proportion, "%")), hjust = -0.3, size = 2, color = "black") +
+  coord_flip() +
+  scale_color_manual(values = c("Quiet" = "#2C7BB6", "Busy" = "#D73027")) +
+  labs(
+    title = "Proportion of Quiet and Busy Shifts During Ramadan (Overnight)",
+    x = "",
+    y = "Percentage"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.text.y = element_text(size = 9, face = "bold")
+  )
+
+# ---- Combined Plot ----
+RamadanCombinedPlot <- wrap_elements(RamadanDayPlot) / wrap_elements(RamadanOvernightPlot) +
+  plot_annotation(title = NULL)
+
+RamadanCombinedPlot
+```
+
+# Preparing Test Set
+```{r}
+## Assign FlowCategory based on Visit_Count thresholds
+TestDataVerOne <- TestDataVerOne %>%
+  mutate(
+    FlowCategory = case_when(
+      Shift == "Day" & Visit_Count <= 157 ~ "Quiet Day",
+      Shift == "Day" & Visit_Count >= 192 ~ "Busy Day",
+      Shift == "Day" ~ "Normal Day",
+      Shift == "Overnight" & Visit_Count <= 171 ~ "Quiet Overnight",
+      Shift == "Overnight" & Visit_Count >= 202 ~ "Busy Overnight",
+      Shift == "Overnight" ~ "Normal Overnight"
+    )
+  )
+
+## Create FlowCategory plot
+Testset_flow_plot <- ggplot(TestDataVerOne, aes(x = FlowCategory, fill = FlowCategory)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5, size = 3) +
+  labs(
+    title = "Distribution of Flow Categories in Test Set",
+    x = "Flow Category",
+    y = "Number of Days"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    legend.position = "none"
+  )
+print(Testset_flow_plot)
+
+
+## Recode to two-class FlowBinary and split into day and overnight
+TestTwoClass <- TestDataVerOne %>%
+  filter(FlowCategory %in% c("Quiet Day", "Quiet Overnight", "Busy Day", "Busy Overnight")) %>%
+  mutate(
+    FlowBinary = case_when(
+      FlowCategory %in% c("Busy Day", "Busy Overnight") ~ "Busy",
+      FlowCategory %in% c("Quiet Day", "Quiet Overnight") ~ "Quiet"
+    ),
+    FlowBinary = factor(FlowBinary, levels = c("Quiet", "Busy"))
+  )
+
+TestDay <- TestTwoClass %>% filter(Shift == "Day")
+TestOvernight <- TestTwoClass %>% filter(Shift == "Overnight")
+
+## Impute and clean Age
+TestDay <- TestDay %>%
+  mutate(Age = ifelse(Age > 100, NA, Age)) %>%
+  group_by(FlowBinary) %>%
+  mutate(Age = ifelse(is.na(Age), median(Age, na.rm = TRUE), Age)) %>%
+  ungroup()
+
+TestOvernight <- TestOvernight %>%
+  mutate(Age = ifelse(Age > 100, NA, Age)) %>%
+  group_by(FlowBinary) %>%
+  mutate(Age = ifelse(is.na(Age), median(Age, na.rm = TRUE), Age)) %>%
+  ungroup()
+
+## Impute PatientCategory
+TestDay <- TestDay %>%
+  mutate(PatientCategory = case_when(
+    !is.na(PatientCategory) ~ PatientCategory,
+    Age <= 12 ~ "Pediatric",
+    Age >= 65 ~ "Geriatric",
+    TRUE ~ "Adult"
+  ))
+
+TestOvernight <- TestOvernight %>%
+  mutate(PatientCategory = case_when(
+    !is.na(PatientCategory) ~ PatientCategory,
+    Age <= 12 ~ "Pediatric",
+    Age >= 65 ~ "Geriatric",
+    TRUE ~ "Adult"
+  ))
+
+## Clean Sex
+TestDay <- TestDay %>%
+  filter(Sex != "Unknown") %>%
+  mutate(Sex = droplevels(Sex))
+
+TestOvernight <- TestOvernight %>%
+  filter(Sex != "Unknown") %>%
+  mutate(Sex = droplevels(Sex))
+
+## Drop missing TriageCategory
+TestDay <- TestDay %>% filter(!is.na(TriageCategory))
+TestOvernight <- TestOvernight %>% filter(!is.na(TriageCategory))
+
+## Drop missing ICDCategory and reassign rare labels
+TestDay <- TestDay %>%
+  filter(!is.na(ICDCategory)) %>%
+  mutate(
+    ICDCategory = ifelse(ICDCategory %in% (count(., ICDCategory) %>% filter(n < 110) %>% pull(ICDCategory)),
+                         "Other/Unknown", ICDCategory),
+    ICDCategory = factor(ICDCategory),
+    ICDCategory = relevel(ICDCategory, ref = "Injury, poisoning and certain other consequences of external causes")
+  )
+
+TestOvernight <- TestOvernight %>%
+  filter(!is.na(ICDCategory)) %>%
+  mutate(
+    ICDCategory = ifelse(ICDCategory %in% (count(., ICDCategory) %>% filter(n < 110) %>% pull(ICDCategory)),
+                         "Other/Unknown", ICDCategory),
+    ICDCategory = factor(ICDCategory),
+    ICDCategory = relevel(ICDCategory, ref = "Injury, poisoning and certain other consequences of external causes")
+  )
+
+## RamadanStatus creation
+TestDay <- TestDay %>%
+  mutate(RamadanStatus = ifelse(is.na(RamadanDay) | RamadanDay == "", "Non-Ramadan", "Ramadan"))
+
+TestOvernight <- TestOvernight %>%
+  mutate(RamadanStatus = ifelse(is.na(RamadanDay) | RamadanDay == "", "Non-Ramadan", "Ramadan"))
+```
+
+
+# Predictive Modeling: Logistic Regression, XGBoost, and Decision Tree
+
+This section presents the development and evaluation of three supervised classification models to predict emergency department (ED) shift-level patient flow status (Quiet vs. Busy). The models were trained separately for Day and Overnight shifts using the training dataset and assessed on the test dataset. 
+
+The modeling techniques applied include:
+- **Logistic Regression**: A baseline statistical model for binary classification.
+- **XGBoost**: An advanced gradient boosting algorithm optimized for performance and imbalance.
+- **Decision Tree**: An interpretable rule-based classifier enhanced with SMOTE for class imbalance.
+
+Each model incorporated temporal, demographic, clinical, and environmental predictors identified through exploratory analysis. Performance was evaluated using ROC curves, AUC, confusion matrices, and classification metrics.
+
+# Logistic Regression Modeling
+## Model Development: Day and Overnight Shift
+```{r Day-Overnight-shift-training, echo=FALSE}
+
+
+# 1. Filter top 12 ICD categories
+combined_icd_day <- bind_rows(
+  TrainDay %>% mutate(Source = "Train"),
+  TestDay %>% mutate(Source = "Test")
+)
+
+# Get top 12 categories excluding "Other/Unknown"
+top_icd_day <- combined_icd_day %>%
+  filter(ICDCategory != "Other/Unknown") %>%
+  count(ICDCategory, sort = TRUE) %>%
+  slice_head(n = 12) %>%
+  pull(ICDCategory)
+
+# Apply to both sets
+TrainDay <- TrainDay %>%
+  filter(ICDCategory %in% top_icd_day) %>%
+  droplevels()
+TestDay <- TestDay %>%
+  filter(ICDCategory %in% top_icd_day) %>%
+  droplevels()
+
+# Relevel categorical predictors
+TrainDay <- TrainDay %>%
+  mutate(
+    ICDCategory = fct_relevel(ICDCategory, "Injury, poisoning and certain other consequences of external causes"),
+    HeatStressCategory = fct_relevel(factor(HeatStressCategory), "No Stress"),
+    Season = fct_relevel(factor(Season), "Winter")
+  )
+
+# Full model - Day
+TrainDayLog <- glm(FlowBinary ~ DateType + Age + Sex + TriageCategory + ICDCategory + HeatStressCategory + Season + RamadanStatus, 
+                   data = TrainDay, 
+                   family = binomial())
+summary(TrainDayLog)
+
+# Top influencing variables - Day
+vip_day_data <- TrainDayLog %>%
+  tidy() %>%
+  filter(term != "(Intercept)") %>%
+  mutate(importance = abs(estimate)) %>%
+  arrange(desc(importance)) %>%
+  slice_head(n = 5)
+
+### TRAINING - OVERNIGHT SHIFT
+
+# 1. Filter top 12 ICD categories (excluding "Other/Unknown")
+combined_icd_overnight <- bind_rows(
+  TrainOvernight %>% mutate(Source = "Train"),
+  TestOvernight %>% mutate(Source = "Test")
+)
+
+top_icd_overnight <- combined_icd_overnight %>%
+  filter(ICDCategory != "Other/Unknown") %>%
+  count(ICDCategory, sort = TRUE) %>%
+  slice_head(n = 12) %>%
+  pull(ICDCategory)
+
+# 2. Filter and drop unused levels
+TrainOvernight <- TrainOvernight %>%
+  filter(ICDCategory %in% top_icd_overnight) %>%
+  droplevels()
+TestOvernight <- TestOvernight %>%
+  filter(ICDCategory %in% top_icd_overnight) %>%
+  droplevels()
+
+# 3. Relevel categorical variables (including DateType)
+TrainOvernight <- TrainOvernight %>%
+  mutate(
+    DateType = fct_relevel(factor(DateType), "Weekday"),
+    ICDCategory = fct_relevel(ICDCategory, "Injury, poisoning and certain other consequences of external causes"),
+    HeatStressCategory = fct_relevel(factor(HeatStressCategory), "No Stress"),
+    Season = fct_relevel(factor(Season), "Winter")
+  )
+
+# 4. Fit logistic regression model (original data)
+TrainOvernightLog <- glm(
+  FlowBinary ~ DateType + Age + Sex + TriageCategory + ICDCategory + 
+    HeatStressCategory + Season + RamadanStatus, 
+  data = TrainOvernight, 
+  family = binomial()
+)
+summary(TrainOvernightLog)
+
+```
+
+```{r Summary-table-variable-importance,echo=FALSE}
+# Summary table
+DaylogRsummary <- tidy(TrainDayLog) %>%
+  mutate(
+    p.value_readable = ifelse(p.value < 0.001, "< 0.001", round(p.value, 3)),
+    Significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      p.value < 0.1   ~ ".",
+      TRUE ~ ""
+    )
+  ) %>%
+  select(term, estimate, std.error, statistic, p.value_readable, Significance)
+
+# Display summary table
+DaylogRsummary %>%
+  kable(format = "html", digits = 3, caption = "Logistic Regression Summary - Day Shift") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%", height = "400px")
+
+# Hosmer–Lemeshow test for Day shift
+hoslem_test_day <- hoslem.test(TrainDayLog$y, fitted(TrainDayLog), g = 10)
+hoslem_test_day
+
+# Variable importance for Day shift
+vip_day_data <- tidy(TrainDayLog) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(importance = abs(estimate)) %>%
+  arrange(desc(importance)) %>%
+  slice_head(n = 5)
+
+# Day Shift variable importance plot 
+vip_day_data %>%
+  ggplot(aes(x = reorder(term, importance), y = importance)) +
+  geom_col(fill = "#2C7BB6") +
+  coord_flip() +
+  labs(title = "Top 5 Influential Features in Day Shift (Logistic Regression)",
+       x = "Variable", y = "Importance") +
+ theme_minimal(base_size = 10) +  # Base font size
+  theme(
+    plot.title = element_text(size = 10, hjust = 0.5,),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    axis.text.y = element_text(size = 8)
+  )
+dev.off()
+
+# Overnight Shift Logistic Regression Summary Table
+overnightlogRsummary <- tidy(TrainOvernightLog) %>%
+  mutate(
+    p.value_readable = ifelse(p.value < 0.001, "< 0.001", round(p.value, 3)),
+    Significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      p.value < 0.1   ~ ".",
+      TRUE ~ ""
+    )
+  ) %>%
+  select(term, estimate, std.error, statistic, p.value_readable, Significance)
+
+# Display summary table
+overnightlogRsummary %>%
+  kable(format = "html", digits = 3, caption = "Logistic Regression Summary - Overnight Shift") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%", height = "400px")
+
+# Hosmer–Lemeshow test for Overnight shift
+hoslem_test_overnight <- hoslem.test(TrainOvernightLog$y, fitted(TrainOvernightLog), g = 10)
+hoslem_test_overnight
+
+# Variable importance for Overnight shift
+vip_overnight_data <- tidy(TrainOvernightLog) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(importance = abs(estimate)) %>%
+  arrange(desc(importance)) %>%
+  slice_head(n = 5)
+
+# Overnight Shift variable importance plot
+vip_overnight_data %>%
+  ggplot(aes(x = reorder(term, importance), y = importance)) +
+  geom_col(fill = "#2C7BB6") +
+  coord_flip() +
+  labs(title = "Top 5 Influential Features in Overnight Shift(Logistic Regression)",
+       x = "Variable", y = "Importance") +
+  theme_minimal(base_size = 10) +  # Base font size
+  theme(
+    plot.title = element_text(size = 10, hjust = 0.5,),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    axis.text.y = element_text(size = 8)
+  )
+```
+
+## Model Evaluation: ROC, AUC and Confusion Matrices
+```{r Day-shift,echo=FALSE}
+# Ensure correct level ordering for plotting and confusion matrix
+TestDay$FlowBinary <- factor(TestDay$FlowBinary, levels = c("Quiet", "Busy"))
+
+# Predict probabilities
+TestDay$pred_prob <- predict(TrainDayLog, newdata = TestDay, type = "response")
+
+# Define numeric ground truth: 1 = Busy, 0 = Quiet
+y_true <- ifelse(TestDay$FlowBinary == "Busy", 1, 0)
+
+# ROC with numeric response
+roc_day <- roc(response = y_true, predictor = TestDay$pred_prob)
+
+# AUC
+auc_day <- auc(roc_day)
+cat("AUC:", round(auc_day, 3), "\n")
+
+
+# Step 4: Optimal threshold
+optimal_threshold <- coords(roc_day, "best", ret = "threshold", best.method = "youden")[[1]]
+
+# Step 5: Predict classes
+TestDay$pred_class <- ifelse(TestDay$pred_prob >= optimal_threshold, "Busy", "Quiet")
+TestDay$pred_class <- factor(TestDay$pred_class, levels = c("Quiet", "Busy"))
+
+# Step 6: Confusion matrix
+conf_matrix_day <- confusionMatrix(
+  data = TestDay$pred_class,
+  reference = TestDay$FlowBinary,
+  positive = "Busy"
+)
+
+# Step 7: Output performance
+cat("\n--- Day Shift Performance with Optimal Threshold ---\n")
+cat(sprintf("Optimal threshold: %.3f\n\n", optimal_threshold))
+print(conf_matrix_day)
+cat(sprintf("AUC: %.3f\n", auc(roc_day)))
+
+# Visualize Confusion Matrix for Day Shift (Logistic Regression)
+
+# Prepare data
+cm_df_day <- as.data.frame(as.table(conf_matrix_day$table))
+
+
+# Plot and print inside device
+print(
+  ggplot(cm_df_day, aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+    scale_fill_gradient(low = "#c6dbef", high = "#08306b") +
+    labs(title = "Confusion Matrix of Day Shift (Logistic Regression)", 
+         x = "Actual", y = "Predicted") +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+      axis.title.x = element_text(size = 9),
+      axis.title.y = element_text(size = 9)
+    )
+)
+
+# ROC Curve Plot
+plot.roc(roc_day, col = "#2C7BB6", lwd = 3, main = "ROC Curve - Day Shift")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+text(0.6, 0.2, labels = paste0("AUC = ", round(auc(roc_day), 3)), col = "black")
+
+# Summary metrics for display
+metrics_day <- tibble::tibble(
+  Metric = c("Accuracy", "Sensitivity", "Specificity", "Balanced Accuracy"),
+  Value = c(
+    conf_matrix_day$overall["Accuracy"],
+    conf_matrix_day$byClass["Sensitivity"],
+    conf_matrix_day$byClass["Specificity"],
+    conf_matrix_day$byClass["Balanced Accuracy"]
+  )
+)
+
+ggplot(metrics_day, aes(x = reorder(Metric, Value), y = Value)) +
+  geom_col(fill = "#1f78b4") +
+  geom_text(aes(label = sprintf("%.2f", Value)), vjust = -0.5, size = 4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(title = "Model Performance Metrics - Day Shift", x = "", y = "Percentage") +
+  theme_minimal()
+
+# Optional: Summary plot with hardcoded values (replace with actual if needed)
+metrics_day_summary <- tibble::tibble(
+  Metric = c("Accuracy", "Sensitivity", "Specificity", "Balanced Accuracy", "AUC"),
+  Value = c(
+    conf_matrix_day$overall["Accuracy"],
+    conf_matrix_day$byClass["Sensitivity"],
+    conf_matrix_day$byClass["Specificity"],
+    conf_matrix_day$byClass["Balanced Accuracy"],
+    auc(roc_day)
+  )
+)
+
+MetricsDaySummary <- ggplot(metrics_day_summary, aes(x = reorder(Metric, Value), y = Value)) +
+  geom_col(fill = "#2C7BB6") +
+  geom_text(aes(label = sprintf("%.2f", Value)), vjust = -0.4, size = 4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1.05)) +
+  labs(
+    title = "Model Performance Metrics - Day Shift",
+    x = NULL,
+    y = "Value (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(face = "bold")
+  )
+```
+
+```{r Overnight-shift,echo=FALSE}
+
+# Ensure correct level ordering: Quiet = 0, Busy = 1
+TestOvernight$FlowBinary <- factor(TestOvernight$FlowBinary, levels = c("Quiet", "Busy"))
+
+# Step 1: Predict probabilities from logistic model
+TestOvernight$pred_prob <- predict(TrainOvernightLog, newdata = TestOvernight, type = "response")
+
+# Step 2: Define numeric ground truth: 1 = Busy, 0 = Quiet
+y_true_overnight <- ifelse(TestOvernight$FlowBinary == "Busy", 1, 0)
+
+# Step 3: Create ROC object using numeric response
+roc_overnight <- roc(response = y_true_overnight, predictor = TestOvernight$pred_prob)
+
+# Step 4: AUC and optimal threshold
+auc_overnight <- auc(roc_overnight)
+cat("AUC:", round(auc_overnight, 3), "\n")
+
+optimal_threshold_overnight <- coords(roc_overnight, "best", ret = "threshold", best.method = "youden")[[1]]
+cat(sprintf("Optimal Threshold (Youden): %.3f\n", optimal_threshold_overnight))
+
+# Step 5: Predict classes using optimal threshold
+TestOvernight$pred_class <- ifelse(TestOvernight$pred_prob >= optimal_threshold_overnight, "Busy", "Quiet")
+TestOvernight$pred_class <- factor(TestOvernight$pred_class, levels = c("Quiet", "Busy"))
+
+# Step 6: Confusion matrix
+conf_matrix_overnight <- confusionMatrix(data = TestOvernight$pred_class, 
+                                    reference = TestOvernight$FlowBinary,
+                                    positive = "Busy")
+
+cat("\n--- Overnight Shift Performance with Optimal Threshold ---\n")
+print(conf_matrix_overnight)
+cat(sprintf("AUC: %.3f\n", auc(roc_overnight)))
+
+# Step 7: Confusion Matrix Heatmap
+cm_df_overnight <- as.data.frame(as.table(conf_matrix_overnight$table))
+
+# Plot
+ggplot(cm_df_overnight, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "#c6dbef", high = "#08306b") +
+  labs(title = "Confusion Matrix of Overnight Shift (Logistic Regression)", x = "Actual", y = "Predicted") +
+theme_minimal(base_size = 10) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9)
+  )
+
+
+# Step 8: ROC Curve
+plot.roc(roc_overnight, col = "#D73027", lwd = 3, main = "ROC Curve - Overnight Shift")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+text(0.6, 0.2, labels = paste0("AUC = ", round(auc(roc_overnight), 3)), col = "black")
+
+# Step 9: Metrics Bar Plot
+metrics_overnight <- tibble::tibble(
+  Metric = c("Accuracy", "Sensitivity", "Specificity", "Balanced Accuracy"),
+  Value = c(
+    conf_matrix_overnight$overall["Accuracy"],
+    conf_matrix_overnight$byClass["Sensitivity"],
+    conf_matrix_overnight$byClass["Specificity"],
+    conf_matrix_overnight$byClass["Balanced Accuracy"]
+  )
+)
+
+ggplot(metrics_overnight, aes(x = reorder(Metric, Value), y = Value)) +
+  geom_col(fill = "#D73027") +
+  geom_text(aes(label = sprintf("%.2f", Value)), vjust = -0.5, size = 4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(title = "Model Performance Metrics - Overnight Shift", x = "", y = "Percentage") +
+  theme_minimal()
+
+# Step 10: Optional Summary Plot
+metrics_overnight_summary <- tibble::tibble(
+  Metric = c("Accuracy", "Sensitivity", "Specificity", "Balanced Accuracy", "AUC"),
+  Value = c(
+    conf_matrix_overnight$overall["Accuracy"],
+    conf_matrix_overnight$byClass["Sensitivity"],
+    conf_matrix_overnight$byClass["Specificity"],
+    conf_matrix_overnight$byClass["Balanced Accuracy"],
+    auc(roc_overnight)
+  )
+)
+
+MetricsOvernightSummary <- ggplot(metrics_overnight_summary, aes(x = reorder(Metric, Value), y = Value)) +
+  geom_col(fill = "#2C7BB6") +
+  geom_text(aes(label = sprintf("%.2f", Value)), vjust = -0.4, size = 4) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1.05)) +
+  labs(
+    title = "Model Performance Metrics - Overnight Shift",
+    x = NULL,
+    y = "Value (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(face = "bold")
+  )
+```
+
+# XGBoost Modelling
+## Model Development: Day Shift
+```{r Day-Shift,echo=FALSE}
+#Creating Xgboost data
+TraindayXgb <- TrainDay %>% 
+  select(DateType, Age, Sex, TriageCategory, ICDCategory, HeatStressCategory, Season, RamadanStatus,FlowBinary)
+
+# Step 1: Convert FlowBinary to numeric (Busy = 1, Quiet = 0)
+y_train <- ifelse(TraindayXgb$FlowBinary == "Busy", 1, 0)
+
+# Step 2: Remove target from predictors
+X_train <- TraindayXgb %>% select(-FlowBinary)
+
+# Step 3: Encode categorical variables using model.matrix
+X_train_matrix <- model.matrix(~ . - 1, data = X_train)
+
+# Step 4: Create DMatrix for training
+dtrain <- xgb.DMatrix(data = X_train_matrix, label = y_train)
+
+
+# Step 5: Set XGBoost parameters
+params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 6
+)
+
+# Step 6: Train XGBoost model
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = list(train = dtrain),
+  early_stopping_rounds = 10,
+  verbose = 1
+)
+
+# Step 7: Visualize top 5 influential variables
+vip(xgb_model, num_features = 5, geom = "col", aesthetics = list(fill = "#1B9E77")) +
+  ggtitle("Top 5 Influential Features in Day Shift (XGBoost)") +
+ theme_minimal(base_size = 10) +  # Base font size
+  theme(
+    plot.title = element_text(size = 10, hjust = 0.5,),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    axis.text.y = element_text(size = 8)
+  )
+```
+
+## Model Development: Overnight Shift
+```{r Overnight,echo=FALSE}
+# Step 1: Prepare training data
+TrainOvernightXgb <- TrainOvernight %>%
+  select(DateType, Age, Sex, TriageCategory, ICDCategory,
+         HeatStressCategory, Season, RamadanStatus, FlowBinary)
+
+X_train <- TrainOvernightXgb %>% select(-FlowBinary)
+
+# Recode FlowBinary as 0 (Quiet) and 1 (Busy)
+y_train <- ifelse(TrainOvernightXgb$FlowBinary == "Busy", 1, 0)
+
+# One-hot encode categorical predictors
+X_train_matrix <- model.matrix(~ . -1, data = X_train)
+
+# Calculate scale_pos_weight
+neg <- sum(y_train == 0)  # Quiet
+pos <- sum(y_train == 1)  # Busy
+scale_pos_weight <- neg / pos
+
+# Create DMatrix
+dtrain <- xgb.DMatrix(data = X_train_matrix, label = y_train)
+
+# Define XGBoost parameters
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  scale_pos_weight = scale_pos_weight,
+  max_depth = 6,
+  eta = 0.1,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+# Train the model
+XGBoostOvernightV3 <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  verbose = 1
+)
+
+#Feature importance
+vip(XGBoostOvernightV3, 
+    num_features = 5, 
+    geom = "col", 
+    aesthetics = list(fill = "#1B9E77")) +
+  ggtitle("Top 5 Influential Features in Overnight Shift (XGBoost)") +
+  theme_minimal(base_size = 10) +  # Base font size
+  theme(
+    plot.title = element_text(size = 10, hjust = 0.5,),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    axis.text.y = element_text(size = 8)
+  )
+
+```
+
+## Model Evaluation: ROC, AUC and Confusion Matrices
+```{r Day-shift,echo=FALSE}
+# Step 0: Define categorical columns
+categorical_cols <- c("DateType", "Sex", "ICDCategory", "HeatStressCategory", "Season", "RamadanStatus")
+
+# Step 1: Select relevant columns from TestDay
+TestDayXgb <- TestDay %>% 
+  select(DateType, Age, Sex, TriageCategory, ICDCategory, HeatStressCategory, Season, RamadanStatus, FlowBinary)
+
+# Step 2: Separate features and target
+X_test_day <- TestDayXgb %>% select(-FlowBinary)
+y_test_day <- TestDayXgb$FlowBinary
+
+# Step 3: Convert character columns to factor and match levels with training
+for (col in categorical_cols) {
+  if (col %in% colnames(X_test_day) && col %in% colnames(X_train)) {
+    X_train[[col]] <- as.factor(X_train[[col]])
+    X_test_day[[col]] <- factor(X_test_day[[col]], levels = levels(X_train[[col]]))
+  }
+}
+
+# Step 4: Create model matrix
+X_test_day_matrix <- model.matrix(~ . - 1, data = X_test_day)
+
+# Step 5: Align test matrix columns with training matrix
+common_cols <- intersect(colnames(X_train_matrix), colnames(X_test_day_matrix))
+X_test_day_matrix <- X_test_day_matrix[, common_cols, drop = FALSE]
+X_train_matrix <- X_train_matrix[, common_cols, drop = FALSE]
+
+# Step 6: Convert outcome to numeric (Busy = 1, Quiet = 0)
+y_test_day <- ifelse(y_test_day == "Busy", 1, 0)
+
+# Step 7: Create DMatrix
+dtest_day <- xgb.DMatrix(data = X_test_day_matrix, label = y_test_day)
+
+# Step 8: Predict probabilities
+xgb_test_day_prob <- predict(xgb_model, newdata = dtest_day)
+
+# Step 9: ROC analysis (Busy = Positive Class)
+roc_xgb_test_day <- roc(response = y_test_day, predictor = xgb_test_day_prob, levels = c(0, 1), direction = "<")
+
+# Step 10: Plot ROC curve
+plot.roc(roc_xgb_test_day, col = "#2C7BB6", lwd = 3, main = "ROC Curve - XGBoost (TestDay)")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+text(0.6, 0.2, labels = paste0("AUC = ", round(auc(roc_xgb_test_day), 3)), col = "black")
+
+# Step 11: AUC and optimal threshold
+cat("AUC:", auc(roc_xgb_test_day), "\n")
+opt_thresh_day <- coords(roc_xgb_test_day, "best", ret = "threshold", best.method = "youden")[[1]]
+cat("Optimal Threshold (Youden):", round(opt_thresh_day, 3), "\n")
+
+# Step 12: Predict classes using threshold
+xgb_test_day_class <- ifelse(xgb_test_day_prob >= opt_thresh_day, 1, 0)
+
+# Step 13: Confusion matrix with Busy as positive class
+confusionMatrix(
+  factor(xgb_test_day_class, levels = c(0, 1), labels = c("Quiet", "Busy")),
+  factor(y_test_day, levels = c(0, 1), labels = c("Quiet", "Busy")),
+  positive = "Busy"
+)
+```
+
+```{r Overnight-shift,echo=FALSE}
+
+# Prepare test set
+X_test <- TestOvernight %>%
+  select(DateType, Age, Sex, TriageCategory, ICDCategory,
+         HeatStressCategory, Season, RamadanStatus)
+
+X_test_matrix <- model.matrix(~ . -1, data = X_test) %>%
+  as.data.frame()
+
+# Align test columns to training columns
+missing_cols <- setdiff(colnames(X_train_matrix), colnames(X_test_matrix))
+for (col in missing_cols) {
+  X_test_matrix[[col]] <- 0
+}
+X_test_matrix <- X_test_matrix[, colnames(X_train_matrix)]
+
+# Create DMatrix for test
+dtest <- xgb.DMatrix(data = as.matrix(X_test_matrix))
+
+# Predict probabilities
+TestOvernight$pred_prob_xgb_v3 <- predict(XGBoostOvernightV3, dtest)
+
+# Create numeric outcome for ROC
+y_true_xgb_v3 <- ifelse(TestOvernight$FlowBinary == "Busy", 1, 0)
+
+# ROC and AUC
+roc_xgb_v3 <- roc(response = y_true_xgb_v3, predictor = TestOvernight$pred_prob_xgb_v3)
+
+# Class prediction using optimal threshold
+opt_thresh_xgb_v3 <- coords(roc_xgb_v3, "best", ret = "threshold", best.method = "youden")[[1]]
+TestOvernight$pred_class_xgb_v3 <- ifelse(TestOvernight$pred_prob_xgb_v3 >= opt_thresh_xgb_v3, "Busy", "Quiet")
+TestOvernight$pred_class_xgb_v3 <- factor(TestOvernight$pred_class_xgb_v3, levels = c("Quiet", "Busy"))
+
+# Confusion matrix
+conf_matrix_xgb_v3 <- confusionMatrix(
+  TestOvernight$pred_class_xgb_v3,
+  TestOvernight$FlowBinary,
+  positive = "Busy"
+)
+
+# Print metrics
+print(conf_matrix_xgb_v3)
+cat("AUC (XGBoost V3 - Overnight):", round(auc(roc_xgb_v3), 3), "\n")
+
+# Plot ROC
+plot.roc(roc_xgb_v3, main = "ROC Curve - XGBoost V3 (Overnight)", col = "#984ea3", lwd = 2)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+text(0.6, 0.2, labels = paste0("AUC = ", round(auc(roc_xgb_v3), 3)), col = "black")
+
+```
+
+
+# Decision Tree Modelling
+## Model Development: Day Shift
+```{r}
+
+# Step 1: Convert FlowBinary to numeric if not already (0 = Quiet, 1 = Busy)
+TrainDay$FlowBinary <- ifelse(TrainDay$FlowBinary == "Busy", 1,
+                       ifelse(TrainDay$FlowBinary == "Quiet", 0, NA))
+TestDay$FlowBinary <- ifelse(TestDay$FlowBinary == "Busy", 1,
+                      ifelse(TestDay$FlowBinary == "Quiet", 0, NA))
+
+# Step 2: Drop rows with missing values
+TrainDay <- TrainDay %>% drop_na(FlowBinary)
+TestDay <- TestDay %>% drop_na(FlowBinary)
+
+# Step 3: Create datasets
+TraindayDT <- TrainDay %>%
+  select(DateType, Age, Sex, TriageCategory, ICDCategory,
+         HeatStressCategory, Season, RamadanStatus, FlowBinary)
+
+TestdayDT <- TestDay %>%
+  select(DateType, Age, Sex, TriageCategory, ICDCategory,
+         HeatStressCategory, Season, RamadanStatus, FlowBinary)
+
+# Step 4: Convert FlowBinary to factor
+TraindayDT$FlowBinary <- factor(TraindayDT$FlowBinary, levels = c(0, 1), labels = c("Quiet", "Busy"))
+TestdayDT$FlowBinary <- factor(TestdayDT$FlowBinary, levels = c(0, 1), labels = c("Quiet", "Busy"))
+
+# Step 5: Train Decision Tree
+tree_day <- rpart(
+  FlowBinary ~ DateType + Age + Sex + TriageCategory + ICDCategory +
+    HeatStressCategory + Season + RamadanStatus,
+  data = TraindayDT,
+  method = "class",
+  parms = list(split = "gini")
+)
+# creating influencing predictors for decision tree in day
+vip_day_dt <- vi(tree_day) %>%
+  slice_max(order_by = Importance, n = 5)
+
+vip_day_dt %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "#984EA3") +  # blue tone
+  coord_flip() +
+  labs(
+    title = "Top 5 Influential Features in Day Shift (Decision Tree)",
+    x = "Variable", y = "Importance") +
+  theme_minimal(base_size = 10) +  # Base font size
+  theme(
+    plot.title = element_text(size = 10, hjust = 0.5,),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    axis.text.y = element_text(size = 8)
+  )
+
+```
+
+## Model Development: Overnight shift
+```{r}
+
+# Step 1: Prepare target variable
+TrainOvernight$FlowBinary <- ifelse(TrainOvernight$FlowBinary == "Busy", 1,
+                             ifelse(TrainOvernight$FlowBinary == "Quiet", 0, NA))
+TestOvernight$FlowBinary <- ifelse(TestOvernight$FlowBinary == "Busy", 1,
+                            ifelse(TestOvernight$FlowBinary == "Quiet", 0, NA))
+
+TrainOvernight <- TrainOvernight %>% drop_na(FlowBinary)
+TestOvernight <- TestOvernight %>% drop_na(FlowBinary)
+
+# Step 2: Create feature matrix and target
+X_overnight <- TrainOvernight %>%
+  select(DateType, Age, Sex, TriageCategory, ICDCategory,
+         HeatStressCategory, Season, RamadanStatus)
+
+y_overnight <- as.numeric(as.character(TrainOvernight$FlowBinary))  # 0 = Quiet, 1 = Busy
+
+# Step 3: Clean predictors (drop single-level columns and ensure factor types)
+X_overnight_clean <- X_overnight %>% select(where(~ n_distinct(.) > 1))
+X_overnight_clean <- X_overnight_clean %>%
+  mutate(across(where(is.character), as.factor))
+
+# Step 4: One-hot encode
+X_matrix <- model.matrix(~ . -1, data = X_overnight_clean)
+
+str(X_overnight_clean)
+sapply(X_overnight, n_distinct)
+head(TrainOvernight)
+
+# Step 5: Apply SMOTE
+smote_result <- SMOTE(X = as.data.frame(X_matrix), target = y_overnight, K = 5, dup_size = 5)
+
+# Step 6: Prepare SMOTE data
+TrainOvernight_SMOTE_DT <- smote_result$data
+names(TrainOvernight_SMOTE_DT)[ncol(TrainOvernight_SMOTE_DT)] <- "FlowBinary"
+TrainOvernight_SMOTE_DT$FlowBinary <- factor(TrainOvernight_SMOTE_DT$FlowBinary, levels = c(0, 1), labels = c("Quiet", "Busy"))
+
+# Step 7: Fit decision tree
+tree_overnight_smote <- rpart(
+  FlowBinary ~ .,
+  data = TrainOvernight_SMOTE_DT,
+  method = "class",
+  parms = list(split = "gini"),
+  control = rpart.control(cp = 0.001, maxdepth = 6, minsplit = 20)
+)
+# creating influencing predictors for decision tree in overnight
+vip_overnight_dt <- vi(tree_overnight_smote) %>%
+  slice_max(order_by = Importance, n = 5)
+
+vip_overnight_dt %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "#984eA3") +  # purple tone
+  coord_flip() +
+  labs(
+    title = "Top 5 Influential Features in Overnight Shift (Decision Tree)",
+    x = "Variable", y = "Importance") +
+  theme_minimal(base_size = 10) +  # Base font size
+  theme(
+    plot.title = element_text(size = 10, hjust = 0.5,),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9),
+    axis.text.y = element_text(size = 8)
+  )
+
+```
+
+## Model Evaluation: ROC, AUC and Confusion Matrices
+```{r}
+# Day Shift Evaluation
+TestdayDT$pred_prob_tree <- predict(tree_day, newdata = TestdayDT, type = "prob")[, "Busy"]
+roc_tree_day <- roc(response = TestdayDT$FlowBinary, predictor = TestdayDT$pred_prob_tree,
+                    levels = c("Quiet", "Busy"), direction = "<")
+plot.roc(roc_tree_day, main = "Decision Tree ROC - Day Shift", col = "#1f78b4", lwd = 2)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+text(0.6, 0.2, labels = paste0("AUC = ", round(auc(roc_tree_day), 3)), col = "black", cex = 1.1)
+
+opt_thresh <- coords(roc_tree_day, "best", ret = "threshold", best.method = "youden")[[1]]
+TestdayDT$pred_class_tree <- ifelse(TestdayDT$pred_prob_tree >= opt_thresh, "Busy", "Quiet")
+TestdayDT$pred_class_tree <- factor(TestdayDT$pred_class_tree, levels = c("Quiet", "Busy"))
+conf_matrix_tree_day <- confusionMatrix(TestdayDT$pred_class_tree, TestdayDT$FlowBinary, positive = "Busy")
+
+print(conf_matrix_tree_day)
+
+TestovernightDT <- TestOvernight %>%
+  select(DateType, Age, Sex, TriageCategory, ICDCategory,
+         HeatStressCategory, Season, RamadanStatus, FlowBinary)
+
+TestovernightDT$FlowBinary <- factor(TestovernightDT$FlowBinary,levels = c(0, 1),labels = c("Quiet", "Busy"))
+
+# Overnight Shift Evaluation
+X_test_overnight <- TestovernightDT %>%
+  select(DateType, Age, Sex, TriageCategory, ICDCategory,
+         HeatStressCategory, Season, RamadanStatus)
+
+X_test_matrix <- model.matrix(~ . -1, data = X_test_overnight) %>% as.data.frame()
+train_cols <- setdiff(colnames(TrainOvernight_SMOTE_DT)[-ncol(TrainOvernight_SMOTE_DT)], colnames(X_test_matrix))
+for (col in train_cols) {
+  X_test_matrix[[col]] <- 0
+}
+X_test_matrix <- X_test_matrix[, colnames(TrainOvernight_SMOTE_DT)[-ncol(TrainOvernight_SMOTE_DT)]]
+
+TestovernightDT$pred_prob_tree_smote <- predict(tree_overnight_smote, newdata = X_test_matrix, type = "prob")[, "Busy"]
+roc_tree_overnight_smote <- roc(
+  response = TestovernightDT$FlowBinary,
+  predictor = TestovernightDT$pred_prob_tree_smote,
+  levels = c("Quiet", "Busy"),
+  direction = "<"
+)
+plot.roc(roc_tree_overnight_smote, main = "Decision Tree ROC - Overnight Shift", col = "#4575b4", lwd = 2)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+text(0.6, 0.2, labels = paste0("AUC = ", round(auc(roc_tree_overnight_smote), 3)), col = "black", cex = 1.1)
+
+opt_thresh_smote <- coords(roc_tree_overnight_smote, "best", ret = "threshold", best.method = "youden")[[1]]
+TestovernightDT$pred_class_tree_smote <- ifelse(TestovernightDT$pred_prob_tree_smote >= opt_thresh_smote, "Busy", "Quiet")
+TestovernightDT$pred_class_tree_smote <- factor(TestovernightDT$pred_class_tree_smote, levels = c("Quiet", "Busy"))
+conf_matrix_tree_smote <- confusionMatrix(
+  TestovernightDT$pred_class_tree_smote,
+  TestovernightDT$FlowBinary,
+  positive = "Busy"
+)
+print(conf_matrix_tree_smote)
+```
+
+```{r}
+dev.off()
+rm(list = ls())
+gc()  # Garbage collection
+
+```
+
